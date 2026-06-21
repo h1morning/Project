@@ -1,10 +1,10 @@
 #include <array>
 #include <cmath>
-#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <cstdlib>
 #include <vector>
 
 using Vec3 = std::array<double, 3>;

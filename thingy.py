@@ -55,3 +55,4 @@ ax.set_ylim(-8000000, 8000000)
 ax.set_zlim(-8000000, 8000000)
 
 plt.show()
+print("yay")
