@@ -15,9 +15,11 @@ constexpr double CIRCULAR_SPEED = 7546.106713761982;
 constexpr double INCLINATION_DEG = 30.0;
 constexpr double DT = 10.0;
 constexpr double PI = 3.14159265358979323846;
+
 const double SIM_TIME = 2.0 * PI * std::sqrt((RADIUS * RADIUS * RADIUS) / MU);
-const double SpaceCraftMass = 1000.0;  // Mass of the spacecraft in kg
-const double ThrustForce = 2000.0 / SpaceCraftMass;  // Thrust force in m/s^2 (2000 N divided by mass)
+const double SpaceCraftMass = 1000.0;
+const double ThrustForce = 2000.0 / SpaceCraftMass;
+const double j2 = 1.08263e-3;
 
 const Vec3 INITIAL_POSITION = {RADIUS, 0.0, 0.0};
 const Vec3 INITIAL_VELOCITY = {
@@ -59,19 +61,23 @@ std::vector<State> simulate_orbit() {
         const double radius = norm(position);
         const double gravity_scale = -MU / (radius * radius * radius);
 
-        const double time = i* DT;
-        Vec3 currentTrust = {0.0, 0.0, 0.0};
+        // J2 perturbation
+        const double j2_factor = 1.5 * j2 * MU / (radius * radius * radius);
+        const double j2_correction = j2_factor * position[2] * position[2] / (radius * radius);
 
-        if (time >= 20.0 && time <=25.0){
-            currentTrust[0] = -ThrustForce * velocity[0] / norm(velocity);
-            currentTrust[1] = -ThrustForce * velocity[1] / norm(velocity);
-            currentTrust[2] = -ThrustForce * velocity[2] / norm(velocity);
+        const double time = i * DT;
+        Vec3 currentThrust = {0.0, 0.0, 0.0};
+
+        if (time >= 20.0 && time <= 25.0) {
+            currentThrust[0] = -ThrustForce * velocity[0] / norm(velocity);
+            currentThrust[1] = -ThrustForce * velocity[1] / norm(velocity);
+            currentThrust[2] = -ThrustForce * velocity[2] / norm(velocity);
         }
 
         Vec3 acceleration = {
-            gravity_scale * position[0] + currentTrust[0],
-            gravity_scale * position[1] + currentTrust[1],
-            gravity_scale * position[2] + currentTrust[2],
+            gravity_scale * position[0] + currentThrust[0],
+            gravity_scale * position[1] + currentThrust[1],
+            gravity_scale * position[2] + currentThrust[2],
         };
 
         Vec3 next_velocity = {
@@ -130,7 +136,7 @@ bool save_plot_html(const std::string& path, const std::vector<State>& trajector
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>3D Orbit of the Satellite</title>
+<title>Animated 3D Orbit</title>
 <style>
 html, body {
     width: 100%;
@@ -141,69 +147,150 @@ html, body {
     color: #111827;
     font-family: Arial, sans-serif;
 }
+
 #plot {
     width: 100vw;
     height: 100vh;
     display: block;
     cursor: grab;
 }
+
 #plot:active {
     cursor: grabbing;
+}
+
+#controls {
+    position: fixed;
+    left: 20px;
+    top: 20px;
+    z-index: 2;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.9);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+    user-select: none;
+}
+
+#controls button {
+    border: 1px solid #9ca3af;
+    border-radius: 8px;
+    background: #ffffff;
+    color: #111827;
+    padding: 6px 10px;
+    font: 14px Arial, sans-serif;
+    cursor: pointer;
+}
+
+#controls button:hover {
+    background: #f3f4f6;
+}
+
+#controls label,
+#controls span {
+    color: #374151;
+    font: 13px Arial, sans-serif;
+}
+
+#speed {
+    width: 140px;
 }
 </style>
 </head>
 <body>
+
 <canvas id="plot"></canvas>
+
+<div id="controls">
+    <button id="playPause">Pause</button>
+    <button id="reset">Reset</button>
+
+    <label for="speed">Speed</label>
+    <input id="speed" type="range" min="10" max="1000" value="200" step="10">
+
+    <span id="speedLabel">200x</span>
+    <span id="timeLabel">t = 0 s</span>
+</div>
+
 <script>
 const trajectory = [
 )HTML";
 
     file << std::setprecision(10);
+
     for (std::size_t i = 0; i < trajectory.size(); ++i) {
         const Vec3& position = trajectory[i].position;
+
         file
             << "    ["
             << position[0] << ", "
             << position[1] << ", "
             << position[2] << "]";
+
         if (i + 1 < trajectory.size()) {
-            file << ',';
+            file << ",";
         }
-        file << '\n';
+
+        file << "\n";
     }
 
     file << R"HTML(];
 
 const AXIS_LIMIT = 8000000;
+const DT_SECONDS = 10;
+const TOTAL_SIM_TIME = (trajectory.length - 1) * DT_SECONDS;
+
 const canvas = document.getElementById("plot");
 const ctx = canvas.getContext("2d");
+
+const playPauseButton = document.getElementById("playPause");
+const resetButton = document.getElementById("reset");
+const speedSlider = document.getElementById("speed");
+const speedLabel = document.getElementById("speedLabel");
+const timeLabel = document.getElementById("timeLabel");
 
 let yaw = -0.75;
 let pitch = 0.55;
 let zoom = 1.0;
+
 let dragging = false;
 let lastX = 0;
 let lastY = 0;
 
+let playing = true;
+let animationTime = 0;
+let speedMultiplier = Number(speedSlider.value);
+let lastFrameTime = null;
+
 function resize() {
     const dpr = window.devicePixelRatio || 1;
+
     canvas.width = Math.floor(window.innerWidth * dpr);
     canvas.height = Math.floor(window.innerHeight * dpr);
+
     canvas.style.width = `${window.innerWidth}px`;
     canvas.style.height = `${window.innerHeight}px`;
+
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
     draw();
 }
 
 function rotate(point) {
     const [x, y, z] = point;
+
     const cy = Math.cos(yaw);
     const sy = Math.sin(yaw);
+
     const cp = Math.cos(pitch);
     const sp = Math.sin(pitch);
 
     const x1 = x * cy - y * sy;
     const y1 = x * sy + y * cy;
+
     const y2 = y1 * cp - z * sp;
     const z2 = y1 * sp + z * cp;
 
@@ -222,15 +309,34 @@ function project(point) {
     return {
         x: window.innerWidth / 2 + x * scale,
         y: window.innerHeight / 2 - y * scale,
+        depth: z
     };
+}
+
+function pointAtTime(timeSeconds) {
+    const rawIndex = timeSeconds / DT_SECONDS;
+    const index = Math.floor(rawIndex);
+    const nextIndex = (index + 1) % trajectory.length;
+    const amount = rawIndex - index;
+
+    const a = trajectory[index];
+    const b = trajectory[nextIndex];
+
+    return [
+        a[0] + (b[0] - a[0]) * amount,
+        a[1] + (b[1] - a[1]) * amount,
+        a[2] + (b[2] - a[2]) * amount
+    ];
 }
 
 function drawLine(a, b, color, width = 1) {
     const pa = project(a);
     const pb = project(b);
+
     ctx.beginPath();
     ctx.moveTo(pa.x, pa.y);
     ctx.lineTo(pb.x, pb.y);
+
     ctx.strokeStyle = color;
     ctx.lineWidth = width;
     ctx.stroke();
@@ -238,6 +344,7 @@ function drawLine(a, b, color, width = 1) {
 
 function drawText(text, point, color, align = "center") {
     const projected = project(point);
+
     ctx.fillStyle = color;
     ctx.textAlign = align;
     ctx.textBaseline = "middle";
@@ -245,7 +352,15 @@ function drawText(text, point, color, align = "center") {
 }
 
 function formatTick(value) {
-    return value.toLocaleString("en-US", { maximumFractionDigits: 0 });
+    return value.toLocaleString("en-US", {
+        maximumFractionDigits: 0
+    });
+}
+
+function formatTime(value) {
+    return value.toLocaleString("en-US", {
+        maximumFractionDigits: 0
+    });
 }
 
 function drawAxes() {
@@ -256,6 +371,7 @@ function drawAxes() {
     drawLine([0, 0, -AXIS_LIMIT], [0, 0, AXIS_LIMIT], "#1c7ed6", 1.5);
 
     const ticks = [-8000000, -4000000, 0, 4000000, 8000000];
+
     for (const tick of ticks) {
         drawLine([tick, -120000, 0], [tick, 120000, 0], "#d94848", 1);
         drawLine([-120000, tick, 0], [120000, tick, 0], "#2f9e44", 1);
@@ -267,6 +383,7 @@ function drawAxes() {
     }
 
     ctx.font = "16px Arial";
+
     drawText("X (m)", [AXIS_LIMIT * 1.08, 0, 0], "#8b1e1e");
     drawText("Y (m)", [0, AXIS_LIMIT * 1.08, 0], "#1d6b31");
     drawText("Z (m)", [0, 0, AXIS_LIMIT * 1.08], "#155fa8");
@@ -274,16 +391,37 @@ function drawAxes() {
 
 function drawTrajectory() {
     ctx.beginPath();
+
     for (let i = 0; i < trajectory.length; i++) {
         const p = project(trajectory[i]);
+
         if (i === 0) {
             ctx.moveTo(p.x, p.y);
         } else {
             ctx.lineTo(p.x, p.y);
         }
     }
+
     ctx.strokeStyle = "#2563eb";
     ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    const currentIndex = Math.floor(animationTime / DT_SECONDS);
+
+    ctx.beginPath();
+
+    for (let i = 0; i <= currentIndex; i++) {
+        const p = project(trajectory[i]);
+
+        if (i === 0) {
+            ctx.moveTo(p.x, p.y);
+        } else {
+            ctx.lineTo(p.x, p.y);
+        }
+    }
+
+    ctx.strokeStyle = "#f97316";
+    ctx.lineWidth = 4;
     ctx.stroke();
 
     const start = project(trajectory[0]);
@@ -300,9 +438,27 @@ function drawTrajectory() {
     ctx.fill();
 }
 
-function draw() {
-    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+function drawSatellite() {
+    const satellite = project(pointAtTime(animationTime));
 
+    ctx.shadowColor = "rgba(249, 115, 22, 0.55)";
+    ctx.shadowBlur = 18;
+
+    ctx.fillStyle = "#f97316";
+    ctx.beginPath();
+    ctx.arc(satellite.x, satellite.y, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.shadowBlur = 0;
+
+    ctx.strokeStyle = "#111827";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(satellite.x, satellite.y, 8, 0, Math.PI * 2);
+    ctx.stroke();
+}
+
+function drawHud() {
     ctx.fillStyle = "#111827";
     ctx.font = "20px Arial";
     ctx.textAlign = "center";
@@ -313,10 +469,54 @@ function draw() {
     ctx.textAlign = "left";
     ctx.fillStyle = "#4b5563";
     ctx.fillText("Drag to rotate, scroll to zoom", 20, window.innerHeight - 30);
+}
+
+function draw() {
+    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
     drawAxes();
     drawTrajectory();
+    drawSatellite();
+    drawHud();
+
+    timeLabel.textContent = `t = ${formatTime(animationTime)} s`;
 }
+
+function animate(timestamp) {
+    if (lastFrameTime === null) {
+        lastFrameTime = timestamp;
+    }
+
+    const elapsedSeconds = (timestamp - lastFrameTime) / 1000;
+    lastFrameTime = timestamp;
+
+    if (playing) {
+        animationTime += elapsedSeconds * speedMultiplier;
+
+        while (animationTime >= TOTAL_SIM_TIME) {
+            animationTime -= TOTAL_SIM_TIME;
+        }
+
+        draw();
+    }
+
+    requestAnimationFrame(animate);
+}
+
+playPauseButton.addEventListener("click", () => {
+    playing = !playing;
+    playPauseButton.textContent = playing ? "Pause" : "Play";
+});
+
+resetButton.addEventListener("click", () => {
+    animationTime = 0;
+    draw();
+});
+
+speedSlider.addEventListener("input", () => {
+    speedMultiplier = Number(speedSlider.value);
+    speedLabel.textContent = `${speedMultiplier}x`;
+});
 
 canvas.addEventListener("mousedown", (event) => {
     dragging = true;
@@ -335,21 +535,28 @@ window.addEventListener("mousemove", (event) => {
 
     yaw += (event.clientX - lastX) * 0.008;
     pitch += (event.clientY - lastY) * 0.008;
+
     pitch = Math.max(-1.35, Math.min(1.35, pitch));
+
     lastX = event.clientX;
     lastY = event.clientY;
+
     draw();
 });
 
 canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
+
     zoom *= event.deltaY > 0 ? 0.9 : 1.1;
     zoom = Math.max(0.4, Math.min(3.0, zoom));
+
     draw();
 }, { passive: false });
 
 window.addEventListener("resize", resize);
+
 resize();
+requestAnimationFrame(animate);
 </script>
 </body>
 </html>
@@ -362,6 +569,7 @@ std::string temp_output_path() {
 #ifdef _MSC_VER
     char* temp = nullptr;
     std::size_t temp_size = 0;
+
     if (_dupenv_s(&temp, &temp_size, "TEMP") != 0 || temp == nullptr || temp[0] == '\0') {
         std::free(temp);
         return "";
@@ -371,13 +579,16 @@ std::string temp_output_path() {
     std::free(temp);
 #else
     const char* temp = std::getenv("TEMP");
+
     if (temp == nullptr || temp[0] == '\0') {
         return "";
     }
 
     std::string path = temp;
 #endif
+
     const char last = path[path.size() - 1];
+
     if (last != '\\' && last != '/') {
         path += '\\';
     }
@@ -390,6 +601,7 @@ Options options_from_args(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+
         if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
             options.csv_path = argv[++i];
         } else if (arg == "--plot-output" && i + 1 < argc) {
@@ -413,6 +625,7 @@ bool open_file(const std::string& path) {
 #else
     const std::string command = "xdg-open \"" + path + "\"";
 #endif
+
     return std::system(command.c_str()) == 0;
 }
 
@@ -422,6 +635,7 @@ int main(int argc, char* argv[]) {
 
     if (!save_trajectory(options.csv_path, trajectory)) {
         const std::string fallback_path = temp_output_path();
+
         if (!fallback_path.empty() && save_trajectory(fallback_path, trajectory)) {
             std::cout
                 << "Could not write trajectory data to " << options.csv_path << '\n'
@@ -431,6 +645,7 @@ int main(int argc, char* argv[]) {
             std::cerr
                 << "Could not write trajectory data to " << options.csv_path
                 << " or the temp directory\n";
+
             return 1;
         }
     } else {
@@ -445,7 +660,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::cout << "Wrote 3D plot to " << options.plot_path << '\n';
+        std::cout << "Wrote animated 3D plot to " << options.plot_path << '\n';
 
         if (options.open_plot && !open_file(options.plot_path)) {
             std::cerr << "Could not open " << options.plot_path << '\n';
