@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <cstdlib>
 #include <vector>
@@ -10,28 +11,47 @@
 using Vec3 = std::array<double, 3>;
 
 constexpr double MU = 398600.44e9;  // Earth's gravitational parameter (m^3/s^2)
-constexpr double RADIUS = 6993000.0;
-constexpr double CIRCULAR_SPEED = 7546.106713761982;
-constexpr double INCLINATION_DEG = 30.0;
+constexpr double EARTH_EQUATORIAL_RADIUS = 6378137.0;  // m
+constexpr double J2 = 1.08263e-3;
 constexpr double DT = 10.0;
 constexpr double PI = 3.14159265358979323846;
+constexpr double SPACECRAFT_MASS = 1000.0;  // kg
+constexpr double THRUST_ACCELERATION = 2000.0 / SPACECRAFT_MASS;  // m/s^2
 
-const double SIM_TIME = 2.0 * PI * std::sqrt((RADIUS * RADIUS * RADIUS) / MU);
-const double SpaceCraftMass = 1000.0;
-const double ThrustForce = 2000.0 / SpaceCraftMass;
-const double j2 = 1.08263e-3;
-
-const Vec3 INITIAL_POSITION = {RADIUS, 0.0, 0.0};
-const Vec3 INITIAL_VELOCITY = {
-    0.0,
-    CIRCULAR_SPEED * std::cos(INCLINATION_DEG * PI / 180.0),
-    CIRCULAR_SPEED * std::sin(INCLINATION_DEG * PI / 180.0),
+struct OrbitalElements {
+    double semi_major_axis;           // a (m)
+    double eccentricity;              // e
+    double inclination;               // i (rad)
+    double right_ascension;           // Omega, RAAN (rad)
+    double argument_of_periapsis;     // omega (rad)
+    double true_anomaly;               // nu (rad)
 };
 
 struct State {
     Vec3 position;
     Vec3 velocity;
 };
+
+constexpr double radians(double degrees) {
+    return degrees * PI / 180.0;
+}
+
+// Edit these six classical orbital elements to set the initial orbit.
+const OrbitalElements INITIAL_ELEMENTS = {
+    7000000.0,       // semi-major axis a (m)
+    0.0,             // eccentricity e
+    radians(45.0),   // inclination i
+    radians(40.0),   // RAAN Omega
+    radians(35.0),   // argument of periapsis omega
+    radians(0.0),    // true anomaly nu
+};
+
+// One Keplerian period, based on the input semi-major axis.
+const double SIM_TIME = 2.0 * PI * std::sqrt(
+    INITIAL_ELEMENTS.semi_major_axis *
+    INITIAL_ELEMENTS.semi_major_axis *
+    INITIAL_ELEMENTS.semi_major_axis / MU
+);
 
 struct Options {
     std::string csv_path = "orbit_cpp.csv";
@@ -48,11 +68,89 @@ double norm(const Vec3& value) {
     );
 }
 
+State orbital_elements_to_state(const OrbitalElements& elements) {
+    const double a = elements.semi_major_axis;
+    const double e = elements.eccentricity;
+    const double i = elements.inclination;
+    const double raan = elements.right_ascension;
+    const double arg_periapsis = elements.argument_of_periapsis;
+    const double nu = elements.true_anomaly;
+
+    if (a <= 0.0 || e < 0.0 || e >= 1.0) {
+        throw std::invalid_argument(
+            "This propagator requires a > 0 and 0 <= e < 1."
+        );
+    }
+
+    // Perifocal-frame state:
+    // p = a(1-e^2)
+    // r_PQW = p/(1+e cos(nu)) [cos(nu), sin(nu), 0]
+    // v_PQW = sqrt(mu/p) [-sin(nu), e+cos(nu), 0]
+    const double p = a * (1.0 - e * e);
+    const double radius = p / (1.0 + e * std::cos(nu));
+    const Vec3 r_perifocal = {
+        radius * std::cos(nu),
+        radius * std::sin(nu),
+        0.0,
+    };
+    const double velocity_scale = std::sqrt(MU / p);
+    const Vec3 v_perifocal = {
+        -velocity_scale * std::sin(nu),
+        velocity_scale * (e + std::cos(nu)),
+        0.0,
+    };
+
+    // Q = R3(Omega) R1(i) R3(omega), mapping PQW to the ECI frame.
+    const double cos_raan = std::cos(raan);
+    const double sin_raan = std::sin(raan);
+    const double cos_i = std::cos(i);
+    const double sin_i = std::sin(i);
+    const double cos_argp = std::cos(arg_periapsis);
+    const double sin_argp = std::sin(arg_periapsis);
+
+    const double q11 = cos_raan * cos_argp - sin_raan * sin_argp * cos_i;
+    const double q12 = -cos_raan * sin_argp - sin_raan * cos_argp * cos_i;
+    const double q21 = sin_raan * cos_argp + cos_raan * sin_argp * cos_i;
+    const double q22 = -sin_raan * sin_argp + cos_raan * cos_argp * cos_i;
+    const double q31 = sin_argp * sin_i;
+    const double q32 = cos_argp * sin_i;
+
+    const auto rotate_to_eci = [=](const Vec3& perifocal) {
+        return Vec3{
+            q11 * perifocal[0] + q12 * perifocal[1],
+            q21 * perifocal[0] + q22 * perifocal[1],
+            q31 * perifocal[0] + q32 * perifocal[1],
+        };
+    };
+
+    return {rotate_to_eci(r_perifocal), rotate_to_eci(v_perifocal)};
+}
+
+Vec3 j2_acceleration(const Vec3& position) {
+    const double radius = norm(position);
+    const double z_over_r = position[2] / radius;
+    const double z_over_r_squared = z_over_r * z_over_r;
+
+    // a_J2 = -(3/2) J2 (mu/r^2) (R_eq/r)^2
+    //        * [(1-5(z/r)^2)x/r,
+    //           (1-5(z/r)^2)y/r,
+    //           (3-5(z/r)^2)z/r]
+    const double factor = -1.5 * J2 * MU *
+        EARTH_EQUATORIAL_RADIUS * EARTH_EQUATORIAL_RADIUS /
+        (radius * radius * radius * radius * radius);
+
+    return {
+        factor * position[0] * (1.0 - 5.0 * z_over_r_squared),
+        factor * position[1] * (1.0 - 5.0 * z_over_r_squared),
+        factor * position[2] * (3.0 - 5.0 * z_over_r_squared),
+    };
+}
+
 std::vector<State> simulate_orbit() {
-    const int n_steps = static_cast<int>(SIM_TIME / DT);
+    const int n_steps = static_cast<int>(SIM_TIME / DT) + 1;
     std::vector<State> trajectory(n_steps);
 
-    trajectory[0] = {INITIAL_POSITION, INITIAL_VELOCITY};
+    trajectory[0] = orbital_elements_to_state(INITIAL_ELEMENTS);
 
     for (int i = 0; i < n_steps - 1; ++i) {
         const Vec3& position = trajectory[i].position;
@@ -60,24 +158,22 @@ std::vector<State> simulate_orbit() {
 
         const double radius = norm(position);
         const double gravity_scale = -MU / (radius * radius * radius);
-
-        // J2 perturbation
-        const double j2_factor = 1.5 * j2 * MU / (radius * radius * radius);
-        const double j2_correction = j2_factor * position[2] * position[2] / (radius * radius);
+        const Vec3 j2 = j2_acceleration(position);
 
         const double time = i * DT;
         Vec3 currentThrust = {0.0, 0.0, 0.0};
 
         if (time >= 20.0 && time <= 25.0) {
-            currentThrust[0] = -ThrustForce * velocity[0] / norm(velocity);
-            currentThrust[1] = -ThrustForce * velocity[1] / norm(velocity);
-            currentThrust[2] = -ThrustForce * velocity[2] / norm(velocity);
+            const double speed = norm(velocity);
+            currentThrust[0] = -THRUST_ACCELERATION * velocity[0] / speed;
+            currentThrust[1] = -THRUST_ACCELERATION * velocity[1] / speed;
+            currentThrust[2] = -THRUST_ACCELERATION * velocity[2] / speed;
         }
 
         Vec3 acceleration = {
-            gravity_scale * position[0] + currentThrust[0],
-            gravity_scale * position[1] + currentThrust[1],
-            gravity_scale * position[2] + currentThrust[2],
+            gravity_scale * position[0] + j2[0] + currentThrust[0],
+            gravity_scale * position[1] + j2[1] + currentThrust[1],
+            gravity_scale * position[2] + j2[2] + currentThrust[2],
         };
 
         Vec3 next_velocity = {
